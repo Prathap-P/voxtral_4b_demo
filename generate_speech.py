@@ -1,11 +1,12 @@
 """
-Voxtral-4B-TTS v4 — Long Text Optimized Generator (Quality Mode)
-Fixes chunk boundary word truncation and voice drift via:
-  - Text overlap conditioning (last sentence carried forward between chunks)
-  - Lower sampling temperature for voice consistency
-  - Sentence-only boundary splitting (no mid-sentence cuts)
-  - Silence trimming + raised-cosine crossfade + RMS loudness matching
-  - Spectral gating noise reduction
+Voxtral-4B-TTS v5 — Less Processing, More Natural
+Fixes audio quality issues from v4 (no natural pauses, voice changes, unnatural sound):
+  - Large 2500-char chunks (5-6 boundaries instead of ~40) to minimize voice drift
+  - No overlap conditioning — simple clean chunks at sentence boundaries
+  - No silence trimming — preserves model's natural pauses between sentences
+  - Silence-gap stitching instead of crossfade — clean gaps between chunks
+  - Paragraph-aware gaps (700ms) vs sentence gaps (300ms)
+  - Minimal post-processing — only final global normalization + light noise reduction
 
 Model: mlx-community/Voxtral-4B-TTS-2603-mlx-bf16 (~8GB, best quality)
 Output: output1.wav (24kHz, lossless)
@@ -27,8 +28,11 @@ MODEL_ID = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
 VOICE = "neutral_male"
 OUTPUT_FILE = "output1.wav"
 SAMPLE_RATE = 24000              # Voxtral native sample rate
-MAX_CHUNK_CHARS = 300            # Shorter chunks = less voice drift within each chunk
-CROSSFADE_MS = 120               # Raised-cosine crossfade overlap at boundaries
+MAX_CHUNK_CHARS = 2500           # Larger chunks = fewer boundaries = less voice drift
+
+# Silence gaps for stitching chunks together
+SENTENCE_GAP_MS = 300            # Silence gap between regular chunks
+PARAGRAPH_GAP_MS = 700           # Longer silence gap at paragraph boundaries
 
 # Generation parameters — lower temp = more consistent voice across chunks
 TEMPERATURE = 0.4                # Default is 0.8; lower = less stochastic voice drift
@@ -37,11 +41,7 @@ TOP_P = 0.90                     # Default is 0.95; slightly tighter nucleus sam
 
 # Post-processing
 ENABLE_NOISE_REDUCTION = True    # Set False to compare raw vs cleaned output
-NOISE_REDUCE_STRENGTH = 0.6     # 0.0 = no reduction, 1.0 = aggressive (0.5-0.7 is sweet spot)
-
-# Silence trimming
-SILENCE_THRESHOLD_DB = -40       # RMS threshold below which audio is considered silence
-SILENCE_MIN_DURATION_MS = 50     # Don't trim silence shorter than this
+NOISE_REDUCE_STRENGTH = 0.3     # 0.0 = no reduction, 1.0 = aggressive (lighter touch preserves quality)
 
 # ─── Text ────────────────────────────────────────────────────────────────────
 # Replace this with your own text (supports 20K-30K+ characters)
@@ -93,20 +93,19 @@ def split_into_sentences(text: str) -> list[str]:
     return [s.strip() for s in raw_parts if s.strip()]
 
 
-# ─── Chunking with Text Overlap ─────────────────────────────────────────────
-def build_chunks_with_overlap(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
+# ─── Chunking ──────────────────────────────────────────────────────────────
+def build_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
     """
-    Build chunks with text overlap for context conditioning.
+    Build chunks at sentence boundaries with paragraph break tracking.
 
     Each chunk includes:
-      - 'overlap_text': Last sentence(s) from previous chunk (context, audio will be trimmed)
-      - 'new_text': New sentences to generate audio for
-      - 'full_text': overlap_text + new_text (what gets sent to the model)
+      - 'text': The text to generate audio for
+      - 'has_paragraph_break': Whether a paragraph break occurs before the NEXT chunk
 
-    The overlap gives the model prosodic context from the previous chunk,
-    solving word truncation at boundaries and voice drift between chunks.
+    Simple chunking — no overlap conditioning. With 2500-char chunks there are
+    only 5-6 boundaries, so overlap adds complexity for minimal benefit.
     """
-    # First, flatten paragraphs and split into sentences
+    # Split into paragraphs, then sentences
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
     all_sentences = []
@@ -119,105 +118,45 @@ def build_chunks_with_overlap(text: str, max_chars: int = MAX_CHUNK_CHARS) -> li
         all_sentences.extend(sentences)
 
     if not all_sentences:
-        return [{"overlap_text": "", "new_text": text, "full_text": text}]
+        return [{"text": text, "has_paragraph_break": False}]
 
     chunks = []
-    current_new_sentences = []
+    current_sentences = []
     current_len = 0
 
     for i, sentence in enumerate(all_sentences):
         # Would adding this sentence exceed the limit?
         added_len = len(sentence) + (1 if current_len > 0 else 0)
 
-        if current_len + added_len > max_chars and current_new_sentences:
+        if current_len + added_len > max_chars and current_sentences:
             # Flush current chunk
-            new_text = " ".join(current_new_sentences)
-
-            # Overlap: last sentence from this chunk becomes context for the next
-            overlap_sentence = current_new_sentences[-1]
-
-            # Build the previous chunk's overlap context
-            if chunks:
-                # This chunk gets overlap from the previous chunk
-                pass  # already handled when chunk was created
-
+            chunk_text = " ".join(current_sentences)
             chunks.append({
-                "new_text": new_text,
-                "overlap_for_next": overlap_sentence,
+                "text": chunk_text,
                 "has_paragraph_break": i in paragraph_break_indices,
             })
 
-            current_new_sentences = [sentence]
+            current_sentences = [sentence]
             current_len = len(sentence)
         else:
-            current_new_sentences.append(sentence)
+            current_sentences.append(sentence)
             current_len += added_len
 
     # Flush remaining sentences
-    if current_new_sentences:
-        new_text = " ".join(current_new_sentences)
+    if current_sentences:
+        chunk_text = " ".join(current_sentences)
         chunks.append({
-            "new_text": new_text,
-            "overlap_for_next": current_new_sentences[-1],
+            "text": chunk_text,
             "has_paragraph_break": False,
         })
 
-    # Now build final chunks with overlap context prepended
-    final_chunks = []
-    for idx, chunk in enumerate(chunks):
-        if idx == 0:
-            # First chunk: no overlap
-            overlap_text = ""
-            full_text = chunk["new_text"]
-        else:
-            # Get overlap from previous chunk
-            overlap_text = chunks[idx - 1]["overlap_for_next"]
-            full_text = overlap_text + " " + chunk["new_text"]
-
-        final_chunks.append({
-            "overlap_text": overlap_text,
-            "new_text": chunk["new_text"],
-            "full_text": full_text,
-            "has_paragraph_break": chunk["has_paragraph_break"],
-        })
-
-    return final_chunks
+    return chunks
 
 
 # ─── Audio Processing Utilities ──────────────────────────────────────────────
-def trim_silence(audio: np.ndarray, threshold_db: float = SILENCE_THRESHOLD_DB,
-                 min_dur_ms: float = SILENCE_MIN_DURATION_MS) -> np.ndarray:
-    """
-    Trim leading and trailing silence from audio using RMS energy detection.
-    Preserves a small buffer to avoid cutting into speech onset.
-    """
-    if len(audio) == 0:
-        return audio
-
-    # Calculate RMS energy in small windows
-    window_samples = int(SAMPLE_RATE * 0.01)  # 10ms windows
-    threshold_linear = 10 ** (threshold_db / 20.0)
-    min_samples = int(SAMPLE_RATE * min_dur_ms / 1000)
-
-    # Find first non-silent sample
-    start = 0
-    for pos in range(0, len(audio) - window_samples, window_samples):
-        window = audio[pos:pos + window_samples]
-        rms = np.sqrt(np.mean(window ** 2))
-        if rms > threshold_linear:
-            start = max(0, pos - min_samples)  # Keep small buffer before speech
-            break
-
-    # Find last non-silent sample
-    end = len(audio)
-    for pos in range(len(audio) - window_samples, start, -window_samples):
-        window = audio[pos:pos + window_samples]
-        rms = np.sqrt(np.mean(window ** 2))
-        if rms > threshold_linear:
-            end = min(len(audio), pos + window_samples + min_samples)
-            break
-
-    return audio[start:end]
+def create_silence(duration_ms: int, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Create a silence array of the specified duration."""
+    return np.zeros(int(sample_rate * duration_ms / 1000), dtype=np.float32)
 
 
 def rms_normalize(audio: np.ndarray, target_rms: float = 0.08) -> np.ndarray:
@@ -238,28 +177,6 @@ def rms_normalize(audio: np.ndarray, target_rms: float = 0.08) -> np.ndarray:
             normalized = normalized * (0.95 / peak)
         return normalized
     return audio
-
-
-def cosine_crossfade(seg1: np.ndarray, seg2: np.ndarray,
-                     overlap_ms: int = CROSSFADE_MS) -> np.ndarray:
-    """
-    Crossfade two audio segments using a raised cosine (Hann) window.
-    Smoother than linear crossfade — no energy dip at the midpoint.
-    """
-    overlap_samples = int(SAMPLE_RATE * overlap_ms / 1000)
-    if len(seg1) < overlap_samples or len(seg2) < overlap_samples:
-        return np.concatenate([seg1, seg2])
-
-    # Raised cosine (Hann) windows — smoother than linear
-    t = np.linspace(0, np.pi, overlap_samples, dtype=np.float32)
-    fade_out = (1 + np.cos(t)) / 2      # 1 → 0 smoothly
-    fade_in = (1 - np.cos(t)) / 2       # 0 → 1 smoothly
-
-    seg1_end = seg1[-overlap_samples:] * fade_out
-    seg2_start = seg2[:overlap_samples] * fade_in
-    blended = seg1_end + seg2_start
-
-    return np.concatenate([seg1[:-overlap_samples], blended, seg2[overlap_samples:]])
 
 
 def reduce_noise(audio: np.ndarray, sample_rate: int = SAMPLE_RATE,
@@ -291,13 +208,13 @@ def format_time(seconds: float) -> str:
 # ─── Main Generation ─────────────────────────────────────────────────────────
 def main():
     print("=" * 70)
-    print("  Voxtral-4B-TTS v4 — Long Text Optimized (Quality Mode)")
-    print("  Fixes: chunk boundary truncation, voice drift, consistency")
+    print("  Voxtral-4B-TTS v5 — Less Processing, More Natural")
+    print("  Fixes: natural pauses, voice consistency, clean stitching")
     print("=" * 70)
 
-    # Build chunks with overlap context
-    chunks = build_chunks_with_overlap(TEXT)
-    total_new_chars = sum(len(c["new_text"]) for c in chunks)
+    # Build chunks at sentence boundaries
+    chunks = build_chunks(TEXT)
+    total_chars = sum(len(c["text"]) for c in chunks)
 
     print(f"\n  Model:          {MODEL_ID}")
     print(f"  Voice:          {VOICE}")
@@ -305,10 +222,9 @@ def main():
     print(f"  Top-k / Top-p:  {TOP_K} / {TOP_P}")
     print(f"  Text:           {len(TEXT):,} characters")
     print(f"  Chunks:         {len(chunks)} (max {MAX_CHUNK_CHARS} chars, sentence boundaries)")
-    print(f"  Overlap:        Last sentence carried forward between chunks")
-    print(f"  Crossfade:      {CROSSFADE_MS}ms raised-cosine")
+    print(f"  Stitching:      Silence gaps ({SENTENCE_GAP_MS}ms sentence / {PARAGRAPH_GAP_MS}ms paragraph)")
     print(f"  Noise reduce:   {'ON (strength={})'.format(NOISE_REDUCE_STRENGTH) if ENABLE_NOISE_REDUCTION else 'OFF'}")
-    print(f"  Normalization:  RMS loudness matching")
+    print(f"  Normalization:  Final global RMS only (preserves natural dynamics)")
     print(f"  Output:         {OUTPUT_FILE}")
     print()
 
@@ -319,36 +235,34 @@ def main():
     load_time = time.time() - start_load
     print(f"Model loaded in {format_time(load_time)}")
 
-    # Generate speech chunk by chunk with overlap conditioning
-    print(f"\nGenerating speech ({len(chunks)} chunks with overlap conditioning)...")
+    # Generate speech chunk by chunk
+    print(f"\nGenerating speech ({len(chunks)} chunks, no overlap conditioning)...")
     print("-" * 70)
 
     start_gen = time.time()
     all_audio_segments = []
+    chunk_metadata = []  # Track has_paragraph_break for assembly
     chars_done = 0
 
     for i, chunk_info in enumerate(chunks):
         chunk_start = time.time()
-        overlap_text = chunk_info["overlap_text"]
-        new_text = chunk_info["new_text"]
-        full_text = chunk_info["full_text"]
+        chunk_text = chunk_info["text"]
         has_para_break = chunk_info["has_paragraph_break"]
 
-        chars_done += len(new_text)
-        progress_pct = (chars_done / total_new_chars) * 100
+        chars_done += len(chunk_text)
+        progress_pct = (chars_done / total_chars) * 100
 
         # Show progress
-        preview = new_text[:55].replace("\n", " ")
-        if len(new_text) > 55:
+        preview = chunk_text[:55].replace("\n", " ")
+        if len(chunk_text) > 55:
             preview += "..."
-        overlap_info = f" [+{len(overlap_text)}ch overlap]" if overlap_text else ""
-        print(f"\n  [{i+1}/{len(chunks)}] ({progress_pct:5.1f}%) \"{preview}\"{overlap_info}")
+        print(f"\n  [{i+1}/{len(chunks)}] ({progress_pct:5.1f}%) \"{preview}\"")
         sys.stdout.flush()
 
-        # Generate audio for full text (overlap + new) with controlled sampling
+        # Generate audio for chunk with controlled sampling
         chunk_audio_parts = []
         for result in model.generate(
-            text=full_text,
+            text=chunk_text,
             voice=VOICE,
             temperature=TEMPERATURE,
             top_k=TOP_K,
@@ -360,36 +274,23 @@ def main():
             print(f"           WARNING: No audio generated for chunk {i+1}")
             continue
 
-        full_audio = np.concatenate(chunk_audio_parts) if len(chunk_audio_parts) > 1 else chunk_audio_parts[0]
-
-        # Trim the overlap audio (proportional estimation)
-        if overlap_text and len(full_text) > 0:
-            overlap_ratio = len(overlap_text) / len(full_text)
-            trim_samples = int(len(full_audio) * overlap_ratio)
-            chunk_audio = full_audio[trim_samples:]
-        else:
-            chunk_audio = full_audio
-
-        # Trim silence from edges (model sometimes adds leading/trailing silence)
-        chunk_audio = trim_silence(chunk_audio)
+        chunk_audio = np.concatenate(chunk_audio_parts) if len(chunk_audio_parts) > 1 else chunk_audio_parts[0]
 
         if len(chunk_audio) == 0:
-            print(f"           WARNING: Chunk {i+1} produced empty audio after trimming")
+            print(f"           WARNING: Chunk {i+1} produced empty audio")
             continue
-
-        # RMS normalize for consistent perceived loudness
-        chunk_audio = rms_normalize(chunk_audio)
 
         chunk_duration = len(chunk_audio) / SAMPLE_RATE
         chunk_time = time.time() - chunk_start
         elapsed = time.time() - start_gen
-        eta = (elapsed / chars_done) * (total_new_chars - chars_done) if chars_done > 0 else 0
+        eta = (elapsed / chars_done) * (total_chars - chars_done) if chars_done > 0 else 0
 
         print(f"           Done: {format_time(chunk_duration)} audio | "
               f"took {format_time(chunk_time)} | "
               f"ETA: {format_time(eta)}")
 
         all_audio_segments.append(chunk_audio)
+        chunk_metadata.append({"has_paragraph_break": has_para_break})
 
         # Periodic memory cleanup
         if (i + 1) % 10 == 0:
@@ -401,14 +302,21 @@ def main():
         print("\nERROR: No audio segments generated!")
         return
 
-    # Assemble final audio with raised-cosine crossfades
-    print(f"\nAssembling {len(all_audio_segments)} segments with cosine crossfade...")
+    # Assemble final audio with silence gaps
+    print(f"\nAssembling {len(all_audio_segments)} segments with silence-gap stitching...")
     if len(all_audio_segments) == 1:
         audio_full = all_audio_segments[0]
     else:
-        audio_full = all_audio_segments[0]
-        for seg in all_audio_segments[1:]:
-            audio_full = cosine_crossfade(audio_full, seg)
+        parts = [all_audio_segments[0]]
+        for idx in range(1, len(all_audio_segments)):
+            # Check if this chunk starts a new paragraph (previous chunk flagged the break)
+            if chunk_metadata[idx - 1]["has_paragraph_break"]:
+                gap = create_silence(PARAGRAPH_GAP_MS)
+            else:
+                gap = create_silence(SENTENCE_GAP_MS)
+            parts.append(gap)
+            parts.append(all_audio_segments[idx])
+        audio_full = np.concatenate(parts)
 
     # Post-processing: Noise Reduction
     if ENABLE_NOISE_REDUCTION:
@@ -418,7 +326,7 @@ def main():
         nr_time = time.time() - nr_start
         print(f"  Noise reduction done in {format_time(nr_time)}")
 
-    # Final RMS normalization of assembled audio
+    # Final global RMS normalization of assembled audio
     audio_full = rms_normalize(audio_full)
 
     # Safety: clip to prevent any floating-point overflow
@@ -432,7 +340,7 @@ def main():
     file_size_mb = (len(audio_full) * 4) / (1024 * 1024)
 
     print(f"\n{'=' * 70}")
-    print(f"  Generation Complete! (v4 — Overlap Conditioning)")
+    print(f"  Generation Complete! (v5 — Less Processing, More Natural)")
     print(f"{'=' * 70}")
     print(f"  File:            {OUTPUT_FILE}")
     print(f"  File size:       {file_size_mb:.1f} MB")
@@ -441,11 +349,10 @@ def main():
     print(f"  Real-time factor: {gen_time/duration:.2f}x (lower is faster)")
     print(f"  Sample rate:     {SAMPLE_RATE} Hz")
     print(f"  Chunks used:     {len(chunks)}")
-    print(f"  Characters:      {total_new_chars:,}")
+    print(f"  Characters:      {total_chars:,}")
     print(f"  Temperature:     {TEMPERATURE}")
     print(f"  Noise reduction: {'ON' if ENABLE_NOISE_REDUCTION else 'OFF'}")
-    print(f"  Overlap:         Sentence-level context conditioning")
-    print(f"  Crossfade:       {CROSSFADE_MS}ms raised-cosine")
+    print(f"  Stitching:       Silence gaps ({SENTENCE_GAP_MS}ms / {PARAGRAPH_GAP_MS}ms)")
     print(f"{'=' * 70}")
     print(f"\nOpen '{OUTPUT_FILE}' in any audio player to listen!")
     print(f"Compare with previous version to hear the improvement.")

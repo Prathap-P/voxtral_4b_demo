@@ -1,5 +1,43 @@
 # Voxtral TTS — Changes Log
 
+## v5 — Less Processing, More Natural (Audio Quality Overhaul)
+
+### Problems Solved
+- **No natural pauses between sentences** — audio sounded like continuous run-on speech
+- **Voice changes between chunks** — different person speaking across boundaries
+- **Overall unnatural sound** — over-processing destroyed audio quality
+
+### Root Cause (from deep analysis)
+- `trim_silence()` stripped ALL natural pauses the model generates
+- `has_paragraph_break` was tracked but NEVER used — paragraph breaks produced same gap as regular chunks
+- Crossfade OVERLAPPED audio (ate 120ms) instead of adding silence gaps
+- 300-char chunks created ~40+ boundaries = 40 chances for voice drift
+- Proportional overlap trimming was only ~90% accurate, causing boundary artifacts
+- Per-chunk RMS normalization + noise reduction at 0.6 degraded audio
+
+### What Changed
+
+| # | Change | Before (v4) | After (v5) | Why |
+|---|--------|-------------|------------|-----|
+| 1 | **Chunk size 300→2500 chars** | 300 chars max | 2500 chars max, sentence boundaries | ~5-6 boundaries instead of ~40, 85% fewer chances for voice drift |
+| 2 | **Removed overlap conditioning** | Last sentence prepended as context; overlap audio trimmed | No overlap — chunks are independent | With 5-6 boundaries, overlap adds complexity for minimal benefit |
+| 3 | **Removed trim_silence()** | Leading/trailing silence trimmed per chunk (RMS energy detection) | No silence trimming — raw model output preserved | Model naturally generates pauses; stripping them caused "no pauses" problem |
+| 4 | **Replaced crossfade with silence gaps** | 120ms raised-cosine crossfade (Hann window) | 300ms silence between chunks, 700ms at paragraph breaks | Speech needs gaps not blending — crossfade was eating 120ms of audio |
+| 5 | **Used has_paragraph_break** | Tracked but never used — same gap everywhere | Paragraph boundaries get 700ms silence vs 300ms for regular chunks | Natural speech has longer pauses between paragraphs than between sentences |
+| 6 | **Reduced post-processing** | Noise reduction 0.6, per-chunk RMS normalization | Noise reduction 0.3, removed per-chunk RMS, only final global RMS | Less processing = more natural; model output is good enough without heavy processing |
+
+### Processing Pipeline (v5)
+```
+Text → Split sentences → Build chunks (2500 chars max, sentence boundaries)
+  → For each chunk: Generate (temp=0.4, top_k=30) — no overlap, no trimming
+  → Assemble with silence gaps (300ms sentence / 700ms paragraph) → Noise reduce (0.3) → Final RMS normalize → WAV
+```
+
+### Key Insight
+The v4 pipeline was over-engineered — trimming, crossfading, overlap conditioning, per-chunk normalization. The model generates good audio natively; the processing was destroying it.
+
+---
+
 ## v4 — Long-Text Quality Fix (Overlap Conditioning + Voice Consistency)
 
 ### Problems Solved

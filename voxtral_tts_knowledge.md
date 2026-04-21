@@ -91,22 +91,22 @@ Each independent `model.generate(text=chunk, voice=VOICE)` call:
 2. Encodes text from scratch with no knowledge of what came before
 3. Uses random sampling (default temp=0.8) causing stochastic voice drift
 
-**This causes**: word truncation at chunk starts, voice drift within chunks, and inconsistent voice across chunks.
+**This causes**: voice drift within chunks and inconsistent voice across chunks. Minimizing the number of chunk boundaries is the most effective mitigation.
 
-### Solution: Text Overlap Conditioning (v4)
-Prepend the **last sentence of the previous chunk** as context when generating each new chunk, then trim the overlap audio. This gives the model prosodic continuity.
+### Solution: Large Chunks + Minimal Boundaries (v5)
+Use **2500-character chunks** at sentence boundaries. With only ~5-6 boundaries instead of ~40 (at 300 chars), voice drift has 85% fewer chances to occur. No overlap conditioning is needed — the complexity it adds is not worth the marginal benefit at so few boundaries.
 
 ```
-Chunk 1: "Sentence A. Sentence B. Sentence C."            → use all audio
-Chunk 2: "Sentence C. Sentence D. Sentence E."            → trim audio for "Sentence C"
-Chunk 3: "Sentence E. Sentence F. Sentence G."            → trim audio for "Sentence E"
+Text (12,500 chars) → 5 chunks of ~2500 chars each → 4 boundaries to manage
+Text (12,500 chars) → 42 chunks of ~300 chars each → 41 boundaries to manage (v4)
 ```
 
-### Chunking Strategy (v4)
-Split text at **sentence boundaries only** (never mid-sentence):
-1. Flatten paragraphs, split into individual sentences
-2. Group sentences into chunks of **300 characters max**
-3. Each chunk carries the last sentence from the previous chunk as overlap context
+### Chunking Strategy (v5)
+Split text at **sentence boundaries only** (never mid-sentence), tracking paragraph breaks:
+1. Split text into paragraphs, then split each paragraph into sentences
+2. Group sentences into chunks of **2500 characters max**
+3. Track `has_paragraph_break` for each chunk boundary (used for silence gap sizing)
+4. No overlap — each chunk is independent
 
 ```python
 import re
@@ -115,35 +115,37 @@ def split_into_sentences(text):
     raw_parts = re.split(r'(?<=[.!?…])\s+', text.strip())
     return [s.strip() for s in raw_parts if s.strip()]
 
-def build_chunks_with_overlap(text, max_chars=300):
+def build_chunks(text, max_chars=2500):
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    all_sentences = []
-    for para in paragraphs:
-        all_sentences.extend(split_into_sentences(para))
+
+    # Build sentence list with paragraph break markers
+    sentence_entries = []
+    for i, para in enumerate(paragraphs):
+        for j, sent in enumerate(split_into_sentences(para)):
+            is_para_start = (j == 0 and i > 0)
+            sentence_entries.append({"text": sent, "para_break_before": is_para_start})
 
     chunks = []
     current_sentences, current_len = [], 0
-    for sentence in all_sentences:
-        added_len = len(sentence) + (1 if current_len > 0 else 0)
+    has_paragraph_break = False
+    for entry in sentence_entries:
+        added_len = len(entry["text"]) + (1 if current_len > 0 else 0)
         if current_len + added_len > max_chars and current_sentences:
             chunks.append({
-                "new_text": " ".join(current_sentences),
-                "overlap_for_next": current_sentences[-1],
+                "text": " ".join(current_sentences),
+                "has_paragraph_break": has_paragraph_break,
             })
-            current_sentences, current_len = [sentence], len(sentence)
+            current_sentences, current_len = [entry["text"]], len(entry["text"])
+            has_paragraph_break = entry["para_break_before"]
         else:
-            current_sentences.append(sentence)
+            current_sentences.append(entry["text"])
             current_len += added_len
+            if entry["para_break_before"]:
+                has_paragraph_break = True
     if current_sentences:
-        chunks.append({"new_text": " ".join(current_sentences), "overlap_for_next": current_sentences[-1]})
+        chunks.append({"text": " ".join(current_sentences), "has_paragraph_break": has_paragraph_break})
 
-    # Build final chunks with overlap prepended
-    final = []
-    for idx, chunk in enumerate(chunks):
-        overlap = chunks[idx - 1]["overlap_for_next"] if idx > 0 else ""
-        full_text = (overlap + " " + chunk["new_text"]).strip() if overlap else chunk["new_text"]
-        final.append({"overlap_text": overlap, "new_text": chunk["new_text"], "full_text": full_text})
-    return final
+    return chunks
 ```
 
 ### Generation Parameters for Consistency
@@ -151,7 +153,7 @@ Lower temperature reduces stochastic voice drift between and within chunks:
 
 ```python
 for result in model.generate(
-    text=full_text,
+    text=chunk["text"],
     voice=VOICE,
     temperature=0.4,    # Default 0.8 causes voice drift; 0.3-0.5 sweet spot
     top_k=30,           # Default 50; tighter for consistency
@@ -160,49 +162,71 @@ for result in model.generate(
     ...
 ```
 
-### Overlap Audio Trimming
-After generating, trim the audio corresponding to the overlap text using proportional estimation:
+### Audio Stitching (v5) — Silence Gaps, Not Crossfade
+- **No silence trimming** — model naturally generates pauses; do NOT strip them
+- **300ms silence gap** between regular chunks (sentence boundaries)
+- **700ms silence gap** at paragraph boundaries (`has_paragraph_break = True`)
+- **No crossfade** — speech needs clean gaps between segments, not blending
+- Run `gc.collect()` every 5 chunks to keep memory in check
 
 ```python
-if overlap_text and len(full_text) > 0:
-    overlap_ratio = len(overlap_text) / len(full_text)
-    trim_samples = int(len(full_audio) * overlap_ratio)
-    chunk_audio = full_audio[trim_samples:]  # Keep only the new audio
+def create_silence(duration_ms, sr=24000):
+    """Create a silence array of the given duration."""
+    return np.zeros(int(sr * duration_ms / 1000), dtype=np.float32)
+
+def assemble_with_silence_gaps(chunk_audios, chunks, sr=24000):
+    """Assemble chunk audio with appropriate silence gaps between them."""
+    if not chunk_audios:
+        return np.array([], dtype=np.float32)
+
+    parts = [chunk_audios[0]]
+    for i in range(1, len(chunk_audios)):
+        # Use 700ms gap at paragraph breaks, 300ms otherwise
+        gap_ms = 700 if chunks[i - 1]["has_paragraph_break"] else 300
+        parts.append(create_silence(gap_ms, sr))
+        parts.append(chunk_audios[i])
+
+    return np.concatenate(parts)
 ```
 
-### Audio Stitching (v4)
-- **No fixed silence gaps** — model naturally generates pauses at sentence endings
-- **Trim leading/trailing silence** per chunk using RMS energy detection (-40dB threshold)
-- **120ms raised-cosine crossfade** (Hann window) — no energy dip at midpoint
-- **RMS loudness normalization** (target 0.08 RMS) — perceived loudness matching, better than peak normalization
-- Run `gc.collect()` every 10 chunks to keep memory in check
-
-```python
-def cosine_crossfade(seg1, seg2, overlap_ms=120, sr=24000):
-    overlap = int(sr * overlap_ms / 1000)
-    if len(seg1) < overlap or len(seg2) < overlap:
-        return np.concatenate([seg1, seg2])
-    t = np.linspace(0, np.pi, overlap, dtype=np.float32)
-    fade_out = (1 + np.cos(t)) / 2  # Hann window: 1 → 0
-    fade_in  = (1 - np.cos(t)) / 2  # Hann window: 0 → 1
-    blended = seg1[-overlap:] * fade_out + seg2[:overlap] * fade_in
-    return np.concatenate([seg1[:-overlap], blended, seg2[overlap:]])
+### Complete v5 Pipeline
 ```
-
-### Complete v4 Pipeline
-```
-Text → Split into sentences → Build chunks (300 chars, sentence boundaries)
-  → For each chunk: prepend overlap sentence → Generate (temp=0.4, top_k=30)
-  → Trim overlap audio (proportional) → Trim silence → RMS normalize
-  → Assemble with cosine crossfade (120ms) → Noise reduce → Final RMS normalize → WAV
+Text → Split sentences → Build chunks (2500 chars max, sentence boundaries)
+  → For each chunk: Generate (temp=0.4, top_k=30) — no overlap, no trimming
+  → Assemble with silence gaps (300ms sentence / 700ms paragraph) → Noise reduce (0.3) → Final RMS normalize → WAV
 ```
 
 ## Post-Processing Pipeline (Critical for Long Text)
 
-Raw model output often contains background noise artifacts (wind, hiss), especially with quantized models or long sequences. Apply this post-processing pipeline after generation:
+Raw model output often contains background noise artifacts (wind, hiss), especially with quantized models or long sequences. The v5 pipeline uses minimal post-processing — the model generates good audio natively, and over-processing destroys quality.
 
-### 1. Per-Chunk RMS Loudness Normalization
-Use RMS normalization (not peak) for consistent perceived volume across chunks:
+### 1. Spectral Gating Noise Reduction (Light)
+Apply after assembling the full audio — removes stationary background noise (wind, hiss). Use a **lower strength (0.3)** than previous versions to preserve natural audio quality:
+
+```python
+import noisereduce as nr
+
+def reduce_noise(audio, sample_rate=24000, strength=0.3):
+    reduced = nr.reduce_noise(
+        y=audio,
+        sr=sample_rate,
+        stationary=True,          # Best for consistent background noise
+        prop_decrease=strength,    # 0.3 for v5 — lighter than v4's 0.6 to preserve natural sound
+        n_fft=1024,               # Frequency resolution for 24kHz speech
+        freq_mask_smooth_hz=200,  # Smooth frequency mask to avoid artifacts
+        time_mask_smooth_ms=100,  # Smooth time mask to avoid choppy audio
+    )
+    return reduced.astype(np.float32)
+```
+
+- **strength 0.3** is the v5 sweet spot — just enough to clean up artifacts without degrading speech
+- **stationary=True** — best for TTS artifacts which are consistent background noise
+- Apply to the full assembled audio, not per-chunk (better noise profile estimation)
+- Requires `pip install noisereduce`
+- **No per-chunk RMS normalization** — removed in v5. Per-chunk normalization was causing volume inconsistencies and contributing to unnatural sound. Only final global RMS is applied.
+
+### 2. Final Global RMS Normalization + Clipping
+After noise reduction, apply a single RMS normalization pass to the complete audio, then clip to [-1.0, 1.0] for safety:
 
 ```python
 def rms_normalize(audio, target_rms=0.08):
@@ -217,53 +241,20 @@ def rms_normalize(audio, target_rms=0.08):
     return audio
 ```
 
-Apply to each chunk immediately after overlap trimming and silence trimming.
-
-### 2. Spectral Gating Noise Reduction
-Apply after assembling the full audio — removes stationary background noise (wind, hiss):
-
+### Complete v5 Post-Processing Order
 ```python
-import noisereduce as nr
+# 1. Generate chunk audio (no overlap, no silence trimming, no per-chunk RMS)
+# 2. Assemble chunks with silence gaps (300ms sentence / 700ms paragraph)
+audio_full = assemble_with_silence_gaps(chunk_audios, chunks)
 
-def reduce_noise(audio, sample_rate=24000, strength=0.6):
-    reduced = nr.reduce_noise(
-        y=audio,
-        sr=sample_rate,
-        stationary=True,          # Best for consistent background noise
-        prop_decrease=strength,    # 0.0 = none, 1.0 = aggressive (0.5-0.7 sweet spot)
-        n_fft=1024,               # Frequency resolution for 24kHz speech
-        freq_mask_smooth_hz=200,  # Smooth frequency mask to avoid artifacts
-        time_mask_smooth_ms=100,  # Smooth time mask to avoid choppy audio
-    )
-    return reduced.astype(np.float32)
-```
-
-- **strength 0.5-0.7** is the sweet spot — removes wind/hiss without making speech robotic
-- **stationary=True** — best for TTS artifacts which are consistent background noise
-- Apply to the full assembled audio, not per-chunk (better noise profile estimation)
-- Requires `pip install noisereduce`
-
-### 3. Final Normalization + Clipping
-After noise reduction, RMS normalize the complete audio, then clip to [-1.0, 1.0] for safety.
-
-### Complete v4 Post-Processing Order
-```python
-# 1. Trim overlap audio (proportional estimation)
-# 2. Trim leading/trailing silence (RMS energy detection)
-# 3. Per-chunk RMS normalization
-chunk_audio = rms_normalize(chunk_audio)
-
-# 4. Assemble chunks with cosine crossfade (120ms)
-# ... (stitching logic)
-
-# 5. Noise reduction on full audio
+# 3. Noise reduction on full audio (light — 0.3 strength)
 audio_full = reduce_noise(audio_full)
 
-# 6. Final RMS normalization + safety clip
+# 4. Final RMS normalization + safety clip
 audio_full = rms_normalize(audio_full)
 audio_full = np.clip(audio_full, -1.0, 1.0)
 
-# 7. Save
+# 5. Save
 sf.write("output.wav", audio_full, 24000)
 ```
 
@@ -318,7 +309,8 @@ pip install <package> --trusted-host pypi.org --trusted-host files.pythonhosted.
 7. **Non-commercial license** — CC BY-NC 4.0. Production/commercial use requires Mistral API.
 8. **4-bit model produces wind/noise artifacts** — The quantized acoustic transformer and codec decoder lose precision, causing intermittent background noise. Use 6-bit or bf16 model for clean output. 6-bit only quantizes the LLM backbone and keeps audio-critical components at BF16.
 9. **6-bit model requires ~3.5GB free disk space** — If disk is full, delete unused cached models from `~/.cache/huggingface/hub/` (e.g., remove 4-bit model if no longer needed).
-10. **noisereduce too aggressive = robotic speech** — Keep `prop_decrease` between 0.5-0.7. Going above 0.8 removes too much frequency content and makes speech sound artificial.
-11. **Each model.generate() creates a fresh KV cache** — There is NO context carryover between calls. Every chunk starts from zero. Use text overlap conditioning (prepend last sentence of previous chunk) to give the model prosodic context.
+10. **noisereduce too aggressive = robotic speech** — v5 uses `prop_decrease=0.3` (lighter touch). Going above 0.5 risks removing frequency content and making speech sound artificial. Previous versions used 0.6 which was too aggressive.
+11. **Each model.generate() creates a fresh KV cache** — There is NO context carryover between calls. Every chunk starts from zero. Use larger chunks (2500 chars) to minimize boundaries — fewer boundaries means fewer chances for voice drift.
 12. **Default temperature (0.8) causes voice drift** — For narration/long text, use temperature 0.3-0.5, top_k 30, top_p 0.90. The default is designed for creative variety, not consistent narration.
-13. **Overlap audio trimming is proportional, not exact** — The proportional estimation (trim X% of audio where X% is overlap text / total text) is ~90% accurate. For critical applications, consider generating the overlap text separately to measure exact audio length.
+13. **Do NOT trim silence from chunk audio** — The model naturally generates pauses between sentences. Previous versions aggressively trimmed silence which destroyed natural speech rhythm. Let the model's native pauses through; they make the output sound human.
+14. **Use silence-gap stitching, not crossfade** — Speech needs clean gaps between segments. Crossfading blends the end of one sentence into the start of another, creating unnatural transitions. Use 300ms silence between sentence chunks and 700ms at paragraph boundaries.
