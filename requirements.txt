@@ -1,0 +1,5 @@
+mlx-audio[tts]==0.4.2
+soundfile==0.13.1
+numpy==2.2.6
+tiktoken
+noisereduce

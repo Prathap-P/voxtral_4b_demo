@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Audio output files (large, generated)
+*.wav
+
+# Voice samples (user-provided, not for public repo)
+voice_samples/
+
+# HuggingFace cache
+.cache/
