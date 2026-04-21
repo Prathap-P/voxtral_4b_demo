@@ -1,5 +1,23 @@
 # Voxtral TTS — Changes Log
 
+## v5.1 — Volume Decay Fix
+
+### Problem
+Audio volume gradually fades within each chunk — loud at the start, quiet at the end. When the next chunk starts, volume jumps back up creating a "sawtooth" loudness pattern.
+
+### Root Cause
+The LLM backbone's attention to the voice embedding tokens dilutes as the KV cache grows during autoregressive generation. At 2500 chars (~60-90s audio, ~750-1125 frames), the voice conditioning signal decays noticeably. Additionally, aggressive noise reduction (0.8) was stripping more audio from the already-quiet end-of-chunk sections.
+
+### What Changed
+
+| # | Change | Before (v5) | After (v5.1) | Why |
+|---|--------|-------------|-------------|-----|
+| 1 | Chunk size | 2500 chars (~60-90s) | 1500 chars (~30-45s) | Shorter chunks = less time for attention to decay |
+| 2 | Per-chunk RMS | Removed | Restored | Levels out volume fade within each chunk before stitching |
+| 3 | Noise reduction | 0.3 (but user tested at 0.8) | 0.3 (enforced) | >0.5 amplifies the volume decay by stripping quiet passages |
+
+---
+
 ## v5 — Less Processing, More Natural (Audio Quality Overhaul)
 
 ### Problems Solved

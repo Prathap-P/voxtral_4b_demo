@@ -93,18 +93,21 @@ Each independent `model.generate(text=chunk, voice=VOICE)` call:
 
 **This causes**: voice drift within chunks and inconsistent voice across chunks. Minimizing the number of chunk boundaries is the most effective mitigation.
 
-### Solution: Large Chunks + Minimal Boundaries (v5)
-Use **2500-character chunks** at sentence boundaries. With only ~5-6 boundaries instead of ~40 (at 300 chars), voice drift has 85% fewer chances to occur. No overlap conditioning is needed — the complexity it adds is not worth the marginal benefit at so few boundaries.
+### Solution: Balanced Chunks (v5.1)
+Use **1500-character chunks** at sentence boundaries. This balances two competing concerns:
+- **Too many boundaries** (300 chars / v4) → voice drift at every boundary
+- **Too few boundaries** (2500 chars / v5) → volume decays within each chunk as attention dilutes
 
 ```
-Text (12,500 chars) → 5 chunks of ~2500 chars each → 4 boundaries to manage
-Text (12,500 chars) → 42 chunks of ~300 chars each → 41 boundaries to manage (v4)
+Text (12,500 chars) → 8-10 chunks of ~1500 chars each → 7-9 boundaries (v5.1 sweet spot)
+Text (12,500 chars) → 5 chunks of ~2500 chars each → 4 boundaries (v5 — volume decay)
+Text (12,500 chars) → 42 chunks of ~300 chars each → 41 boundaries (v4 — voice drift)
 ```
 
 ### Chunking Strategy (v5)
 Split text at **sentence boundaries only** (never mid-sentence), tracking paragraph breaks:
 1. Split text into paragraphs, then split each paragraph into sentences
-2. Group sentences into chunks of **2500 characters max**
+2. Group sentences into chunks of **1500 characters max**
 3. Track `has_paragraph_break` for each chunk boundary (used for silence gap sizing)
 4. No overlap — each chunk is independent
 
@@ -115,7 +118,7 @@ def split_into_sentences(text):
     raw_parts = re.split(r'(?<=[.!?…])\s+', text.strip())
     return [s.strip() for s in raw_parts if s.strip()]
 
-def build_chunks(text, max_chars=2500):
+def build_chunks(text, max_chars=1500):
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
     # Build sentence list with paragraph break markers
@@ -189,10 +192,10 @@ def assemble_with_silence_gaps(chunk_audios, chunks, sr=24000):
     return np.concatenate(parts)
 ```
 
-### Complete v5 Pipeline
+### Complete v5.1 Pipeline
 ```
-Text → Split sentences → Build chunks (2500 chars max, sentence boundaries)
-  → For each chunk: Generate (temp=0.4, top_k=30) — no overlap, no trimming
+Text → Split sentences → Build chunks (1500 chars max, sentence boundaries)
+  → For each chunk: Generate (temp=0.4, top_k=30) → Per-chunk RMS normalize
   → Assemble with silence gaps (300ms sentence / 700ms paragraph) → Noise reduce (0.3) → Final RMS normalize → WAV
 ```
 
@@ -223,7 +226,7 @@ def reduce_noise(audio, sample_rate=24000, strength=0.3):
 - **stationary=True** — best for TTS artifacts which are consistent background noise
 - Apply to the full assembled audio, not per-chunk (better noise profile estimation)
 - Requires `pip install noisereduce`
-- **No per-chunk RMS normalization** — removed in v5. Per-chunk normalization was causing volume inconsistencies and contributing to unnatural sound. Only final global RMS is applied.
+- **Per-chunk RMS normalization restored in v5.1** — v5 removed it but v5.1 brings it back to fix volume decay within long chunks. Each chunk is normalized to target RMS before stitching, then final global RMS is applied after assembly.
 
 ### 2. Final Global RMS Normalization + Clipping
 After noise reduction, apply a single RMS normalization pass to the complete audio, then clip to [-1.0, 1.0] for safety:
@@ -241,9 +244,10 @@ def rms_normalize(audio, target_rms=0.08):
     return audio
 ```
 
-### Complete v5 Post-Processing Order
+### Complete v5.1 Post-Processing Order
 ```python
-# 1. Generate chunk audio (no overlap, no silence trimming, no per-chunk RMS)
+# 1. Generate chunk audio (no overlap, no silence trimming)
+# 1b. Per-chunk RMS normalization (fixes volume decay)
 # 2. Assemble chunks with silence gaps (300ms sentence / 700ms paragraph)
 audio_full = assemble_with_silence_gaps(chunk_audios, chunks)
 
@@ -310,7 +314,9 @@ pip install <package> --trusted-host pypi.org --trusted-host files.pythonhosted.
 8. **4-bit model produces wind/noise artifacts** — The quantized acoustic transformer and codec decoder lose precision, causing intermittent background noise. Use 6-bit or bf16 model for clean output. 6-bit only quantizes the LLM backbone and keeps audio-critical components at BF16.
 9. **6-bit model requires ~3.5GB free disk space** — If disk is full, delete unused cached models from `~/.cache/huggingface/hub/` (e.g., remove 4-bit model if no longer needed).
 10. **noisereduce too aggressive = robotic speech** — v5 uses `prop_decrease=0.3` (lighter touch). Going above 0.5 risks removing frequency content and making speech sound artificial. Previous versions used 0.6 which was too aggressive.
-11. **Each model.generate() creates a fresh KV cache** — There is NO context carryover between calls. Every chunk starts from zero. Use larger chunks (2500 chars) to minimize boundaries — fewer boundaries means fewer chances for voice drift.
+11. **Each model.generate() creates a fresh KV cache** — There is NO context carryover between calls. Every chunk starts from zero. Use 1500-char chunks as the sweet spot — fewer boundaries than 300 (voice drift) but shorter than 2500 (volume decay).
 12. **Default temperature (0.8) causes voice drift** — For narration/long text, use temperature 0.3-0.5, top_k 30, top_p 0.90. The default is designed for creative variety, not consistent narration.
 13. **Do NOT trim silence from chunk audio** — The model naturally generates pauses between sentences. Previous versions aggressively trimmed silence which destroyed natural speech rhythm. Let the model's native pauses through; they make the output sound human.
 14. **Use silence-gap stitching, not crossfade** — Speech needs clean gaps between segments. Crossfading blends the end of one sentence into the start of another, creating unnatural transitions. Use 300ms silence between sentence chunks and 700ms at paragraph boundaries.
+15. **Volume decays within long chunks (>45s)** — The LLM's attention to the voice embedding dilutes as the KV cache grows. At 2500-char chunks (~60-90s audio), the end of each chunk is noticeably quieter than the start. Fix: use 1500-char chunks (~30-45s) and apply per-chunk RMS normalization to level out the volume before stitching.
+16. **Aggressive noise reduction amplifies volume decay** — At `prop_decrease` > 0.5, the spectral gating strips more audio from the already-quiet end-of-chunk sections, making the fade-out worse. Keep noise reduction at 0.3 max when using long chunks.

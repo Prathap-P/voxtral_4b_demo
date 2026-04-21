@@ -1,12 +1,10 @@
 """
-Voxtral-4B-TTS v5 — Less Processing, More Natural (FAST Mode / 6-bit)
-Fixes audio quality issues from v4 (no natural pauses, voice changes, unnatural sound):
-  - Large 2500-char chunks (5-6 boundaries instead of ~40) to minimize voice drift
-  - No overlap conditioning — simple clean chunks at sentence boundaries
-  - No silence trimming — preserves model's natural pauses between sentences
-  - Silence-gap stitching instead of crossfade — clean gaps between chunks
-  - Paragraph-aware gaps (700ms) vs sentence gaps (300ms)
-  - Minimal post-processing — only final global normalization + light noise reduction
+Voxtral-4B-TTS v5.1 — Volume Decay Fix (FAST Mode / 6-bit)
+Fixes v5's volume fade-out within long chunks (attention decay over 60-90s):
+  - Reduced chunk size to 1500 chars (~30-45s audio, within attention sweet spot)
+  - Per-chunk RMS normalization to level out volume before stitching
+  - Lighter noise reduction (0.3) to avoid stripping quiet end-of-chunk audio
+  - Still: no overlap, no silence trimming, silence-gap stitching, paragraph gaps
 
 Model: mlx-community/Voxtral-4B-TTS-2603-mlx-6bit (~3.5GB, fast inference)
 Output: output_fast.wav (24kHz, lossless)
@@ -28,7 +26,7 @@ MODEL_ID = "mlx-community/Voxtral-4B-TTS-2603-mlx-6bit"
 VOICE = "neutral_male"
 OUTPUT_FILE = "output_fast.wav"
 SAMPLE_RATE = 24000              # Voxtral native sample rate
-MAX_CHUNK_CHARS = 2500           # Larger chunks = fewer boundaries = less voice drift
+MAX_CHUNK_CHARS = 1500           # Balance: few boundaries (8-10) but short enough to avoid volume decay
 
 # Silence gaps for stitching chunks together
 SENTENCE_GAP_MS = 300            # Silence gap between regular chunks
@@ -132,8 +130,8 @@ def build_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
       - 'text': The text to generate audio for
       - 'has_paragraph_break': Whether a paragraph break occurs before the NEXT chunk
 
-    Simple chunking — no overlap conditioning. With 2500-char chunks there are
-    only 5-6 boundaries, so overlap adds complexity for minimal benefit.
+    Simple chunking — no overlap conditioning. With 1500-char chunks there are
+    ~8-10 boundaries — balanced to avoid both voice drift and volume decay.
     """
     # Split into paragraphs, then sentences
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -238,8 +236,8 @@ def format_time(seconds: float) -> str:
 # ─── Main Generation ─────────────────────────────────────────────────────────
 def main():
     print("=" * 70)
-    print("  Voxtral-4B-TTS v5 — Less Processing, More Natural (FAST Mode / 6-bit)")
-    print("  Fixes: natural pauses, voice consistency, clean stitching")
+    print("  Voxtral-4B-TTS v5.1 — Volume Decay Fix (FAST Mode / 6-bit)")
+    print("  Fixes: volume fade-out, natural pauses, voice consistency")
     print("=" * 70)
 
     # Build chunks at sentence boundaries
@@ -255,7 +253,7 @@ def main():
     print(f"  Chunks:         {len(chunks)} (max {MAX_CHUNK_CHARS} chars, sentence boundaries)")
     print(f"  Stitching:      Silence gaps ({SENTENCE_GAP_MS}ms sentence / {PARAGRAPH_GAP_MS}ms paragraph)")
     print(f"  Noise reduce:   {'ON (strength={})'.format(NOISE_REDUCE_STRENGTH) if ENABLE_NOISE_REDUCTION else 'OFF'}")
-    print(f"  Normalization:  Final global RMS only (preserves natural dynamics)")
+    print(f"  Normalization:  Per-chunk RMS + final global RMS (fixes volume decay)")
     print(f"  Output:         {OUTPUT_FILE}")
     print()
 
@@ -310,6 +308,10 @@ def main():
         if len(chunk_audio) == 0:
             print(f"           WARNING: Chunk {i+1} produced empty audio")
             continue
+
+        # Per-chunk RMS normalization — fixes volume decay within long chunks
+        # (attention to voice embedding fades as sequence grows, causing quieter end-of-chunk audio)
+        chunk_audio = rms_normalize(chunk_audio)
 
         chunk_duration = len(chunk_audio) / SAMPLE_RATE
         chunk_time = time.time() - chunk_start
@@ -371,7 +373,7 @@ def main():
     file_size_mb = (len(audio_full) * 4) / (1024 * 1024)
 
     print(f"\n{'=' * 70}")
-    print(f"  Generation Complete! (v5 FAST — Less Processing, More Natural)")
+    print(f"  Generation Complete! (v5.1 FAST — Volume Decay Fix)")
     print(f"{'=' * 70}")
     print(f"  File:            {OUTPUT_FILE}")
     print(f"  File size:       {file_size_mb:.1f} MB")

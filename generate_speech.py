@@ -1,12 +1,10 @@
 """
-Voxtral-4B-TTS v5 — Less Processing, More Natural
-Fixes audio quality issues from v4 (no natural pauses, voice changes, unnatural sound):
-  - Large 2500-char chunks (5-6 boundaries instead of ~40) to minimize voice drift
-  - No overlap conditioning — simple clean chunks at sentence boundaries
-  - No silence trimming — preserves model's natural pauses between sentences
-  - Silence-gap stitching instead of crossfade — clean gaps between chunks
-  - Paragraph-aware gaps (700ms) vs sentence gaps (300ms)
-  - Minimal post-processing — only final global normalization + light noise reduction
+Voxtral-4B-TTS v5.1 — Volume Decay Fix
+Fixes v5's volume fade-out within long chunks (attention decay over 60-90s):
+  - Reduced chunk size to 1500 chars (~30-45s audio, within attention sweet spot)
+  - Per-chunk RMS normalization to level out volume before stitching
+  - Lighter noise reduction (0.3) to avoid stripping quiet end-of-chunk audio
+  - Still: no overlap, no silence trimming, silence-gap stitching, paragraph gaps
 
 Model: mlx-community/Voxtral-4B-TTS-2603-mlx-bf16 (~8GB, best quality)
 Output: output1.wav (24kHz, lossless)
@@ -28,7 +26,7 @@ MODEL_ID = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
 VOICE = "neutral_male"
 OUTPUT_FILE = "output1.wav"
 SAMPLE_RATE = 24000              # Voxtral native sample rate
-MAX_CHUNK_CHARS = 2500           # Larger chunks = fewer boundaries = less voice drift
+MAX_CHUNK_CHARS = 1500           # Balance: few boundaries (8-10) but short enough to avoid volume decay
 
 # Silence gaps for stitching chunks together
 SENTENCE_GAP_MS = 300            # Silence gap between regular chunks
@@ -41,7 +39,7 @@ TOP_P = 0.90                     # Default is 0.95; slightly tighter nucleus sam
 
 # Post-processing
 ENABLE_NOISE_REDUCTION = True    # Set False to compare raw vs cleaned output
-NOISE_REDUCE_STRENGTH = 0.3     # 0.0 = no reduction, 1.0 = aggressive (lighter touch preserves quality)
+NOISE_REDUCE_STRENGTH = 0.3     # 0.0 = no reduction, 1.0 = aggressive (0.3 preserves quiet passages)
 
 # ─── Text ────────────────────────────────────────────────────────────────────
 # Replace this with your own text (supports 20K-30K+ characters)
@@ -51,31 +49,6 @@ TEXT = (
 When a target is identified, the system calculates variables such as weather conditions... fuel consumption, and collateral effects. It does not operate like a chatbot or Skynet; instead, it serves as an orchestration layer on top of data streams. The Under Secretary clarifies that no Large Language Model is baked into the kill chain itself... countering common misconceptions about automated killing. Instead, tools like Palantir surface choices that are otherwise consumed by spreadsheets and PowerPoint files—methods historically used to relay target lists. The digitalization of targeting processes accelerates these decisions, granting a single operator the power of many more. While permissions and authorities remain strictly human-controlled to ensure checks and balances, the system provides better outcomes through informed clicks. This shift from manual coordination to AI-assisted synthesis represents a responsible evolution of war fighting... moving beyond the chaos of unconnected data to a unified strategy.
 
 The discussion outlines three layers of artificial intelligence application within defense, starting with efficiency... Mundane work is streamlined so personnel can focus on more interesting tasks. Then there is the intelligence layer... Imagine all the intelligence gathered from satellite imagery worldwide. Currently, a human analyst must look at everything to make a judgment... but with historical data and AI synthesis, the system can identify anomalies. It learns what those anomalies are—creating a totally different paradigm for intelligence analysis if you will. Moving on to the third layer, war fighting... AI takes all paperwork and modeling and simulation to react faster. But also more precisely.
-
-These are tangible ways AI is used, yet there remains skepticism about its role in decision-making. Speed wins the game... Look at what happened in Venezuela—the speed at which that execution of that operation meant there were no casualties on our side. If you had to spend way more time, you weren't able to synthesize information as well... Speed has to be one of our prerogatives, but better information is the goal so that decisions are more precise. Is there a limit to what this can do? The interviewee confirms there is... No one believes there is some all-seeing, all-knowing answer to human conflict which has been happening since humans existed. Ultimately what you want is clear objectives, manpower and machinery to do it... with the least cost, the least amount of damage, and quickest time.
-
-The worry is about other countries who don't have that... They use AI to take humans out of the decision-making process because they distrust their generals due to graft. Which governments are referenced? China represents the biggest military buildup in world history, and there has been a purge of generals... How do you replace all these people? What is the command and control? It is just a different mindset. Currently, LLMs are largely chatbot uses... but the AI industry is moving towards agents—letting the AI take some action for you. The plan here is not to automate warfare... Yet if an adversary does that, can you really afford to sit still and do it by the book? It becomes tempting when an LM gets 99% of the way there... The response is that the US must be AI dominant so we are never faced where counterforce AI is better than our AI.
-
-People confuse automation with an automated army... What about an automated mind sweeping or detection operation? There is no human underwater... yet there is an action you want to take. Well, we don't want mines on our shores... Or there is a missile coming at you and you want to take it down from space. Like Golden Dome, how do you do that? You have to do that in 90 seconds when it is launched. Those kinds of things are where automation fits, but human oversight remains on the most consequential decisions.
-
-The conversation opens with the critical challenge of retrieving systems from space within a ninety-second window following launch. While extreme circumstances require automation capabilities, mobilizing an entire fleet or army remains beyond current operational planning... Consequently, a thirty-five-page Department of Defense directive mandates human oversight to ensure controls are constantly updated and systems are managed properly. Moving on, data layers offer another potential utility... specifically regarding strikes before they occur. Consider the school in Minab, Iran, where playground markings might signal a target to avoid firing at civilians. This is the point of using autonomous systems... they augment human decision-making rather than replacing it. It could operate on the front end to flag warnings or the back end to verify targets, but ultimately humans must make the final decision.
-
-Regarding terminology... Large Language Models are evolving beyond text-only processing. They will become visual models trained on robotics, consumer data like Nest Cams and YouTube movement... These proprietary datasets are becoming incredibly valuable for training AI. Let us turn to drone warfare, specifically the contrasting scenarios in Ukraine and Iran... In Russia and Ukraine... there is a battle over territory where lines are drawn. Here, robots act as the front line while humans remain back... sending machines first to reduce human risk. Conversely, in Iran, the lesson is about cost imbalance. A cheap drone can threaten expensive targets... forcing defenders to use multi-million dollar counter measures against low-cost threats.
-
-This has driven a push for mass attritable weapons... affordable systems that can be manufactured quickly and designed to be lost. These differ from billion-dollar platforms taking ten years to build... The new drone dominance program focuses on low-cost units around thirty thousand dollars each. Acting as one-way attack drones similar to Shahid models, while Ukraine offered collaboration... the program prioritizes supply chains free from adversary dependency. Ensuring onshore manufacturing where possible, China has been displaying drone swarms that look like art but function as military simulations... armed drones communicating to reform against defenses. Defending small bases or garrisons is a new challenge that emerged from the Ukraine Russia war... requiring both offensive and defensive strategies. A counter unmanned systems task force is now looking at lasers, directed energy... and electronic warfare to take down these interoperable threats. Finally, cyber warfare faces similar AI impacts... models trained on code learn vulnerabilities quickly. This presents risk and opportunity as adversaries distill frontier model capabilities for the next wave of innovation... making AI critical to Pentagon operations regarding targeting, information synthesis, and security fronts. The discussion will now shift to selecting AI vendors... focusing on the situation with Anthropic and other key topics.
-
-Now, a recent Big Technology Podcast segment featured host Emil Michael. They discussed the Under Secretary's stance on AI vendors... OpenAI focused on consumers, but Anthropic targeted government services. This happened after Biden's executive order... Google is catching up with specific divisions yet a culture clash remains. The Department of War lacks safeguards in the public eye... But decades of procedures exist internally.
-
-So, the Maven Smart System contract was renegotiated under scrutiny... Anthropic desired provisions against mass surveillance. Policy banned AI for kinetic actions. It took three months to explain why exceptions can't run a department of three million people... The contract was called off. Pentagon deemed Anthropic a supply chain risk. Michael questioned how they were banned if they agreed to lawful uses...
-
-Now, regarding cyber capabilities, Michael highlighted Mythos and project Glass Wing. An AI security institute assessment found it completed a thirty-two step corporate network attack end-to-end... Human experts would take twenty hours to replicate this autonomous cyber weaponization. While not encouraging use, he argued for keeping the tool against drone threats. Choosing one provider is an original sin... requiring gargantuan software effort on classified networks. Adversaries use distillation attacks showing up in Deep Seek within months...
-
-The dialogue likened AI to a cyber nuclear bomb due to potential outcomes. Concerns include forty percent unemployment... or global coercion alongside bio-chemical risks. Management teams are judged on national security fit, distinct from foreign chip manufacturers... Hosting Anthropic models on Amazon cloud requires control over upgrade cycles compressing to three months. These updates introduce bugs alongside new model weights and guardrails... Scientists at the CDC assumed a refusal was from bad actors. Yet it was an off-the-shelf model...
-
-A culture clash exists between Silicon Valley and the government, referencing Pete Hegseth's stance. No company should dictate terms to the Department of Defense... Despite revenue tripling in three months, a legal challenge involved Judge Rita Lynn ruling records showed hostility through the press... The speaker dismissed this as overreaching because vendors can't dictate government hiring based on disagreement. Ultimately, the Department of Defense cares about war fighters and national security above all else...
-
-With three million employees, they require trust to handle unpredictability in Iran or similar conflicts. Google Gemini faced protests but returned working with the Pentagon, proving alignment is critical during actual conflicts... The government prioritizes safety and mission success over vendor convenience regarding the 2018 Maven project. The official expressed hope that tech companies mature in understanding government partnerships now...
-
 Moving to conflicts of interest, the host queried about XAI and SpaceX holdings. The official confirmed he sold all SpaceX stock to comply with the Office of Government Ethics... Defense company stocks are red lines, and he recused himself from XAI dealings until the sale cleared. Next came procurement reform involving Uber and Palantir dynamics... Defense contractors consolidated from fifty down to five since the Cold War, making supply chains brittle.
 
 The official argued shifting from cost-plus contracts to performance-based deals is necessary... If a weapon works on time, they get paid; if not, they do not. This risk-sharing model benefits taxpayers and encourages innovation without massive speculative R&D burdens... Founders like Palmer Lucky are willing to enter this business finally. Finally, the conversation addressed the Pentagon Pizza Index tracking orders to predict military action... The official dismissed this entirely stating he has no idea how food gets delivered inside the Pentagon building. There are no specific Papa John's locations delivering directly in... The segment concluded by thanking guests for visiting Washington DC. This occurred before signing off on Big Technology Podcast.""")
@@ -102,8 +75,8 @@ def build_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
       - 'text': The text to generate audio for
       - 'has_paragraph_break': Whether a paragraph break occurs before the NEXT chunk
 
-    Simple chunking — no overlap conditioning. With 2500-char chunks there are
-    only 5-6 boundaries, so overlap adds complexity for minimal benefit.
+    Simple chunking — no overlap conditioning. With 1500-char chunks there are
+    ~8-10 boundaries — balanced to avoid both voice drift and volume decay.
     """
     # Split into paragraphs, then sentences
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -208,8 +181,8 @@ def format_time(seconds: float) -> str:
 # ─── Main Generation ─────────────────────────────────────────────────────────
 def main():
     print("=" * 70)
-    print("  Voxtral-4B-TTS v5 — Less Processing, More Natural")
-    print("  Fixes: natural pauses, voice consistency, clean stitching")
+    print("  Voxtral-4B-TTS v5.1 — Volume Decay Fix")
+    print("  Fixes: volume fade-out, natural pauses, voice consistency")
     print("=" * 70)
 
     # Build chunks at sentence boundaries
@@ -224,7 +197,7 @@ def main():
     print(f"  Chunks:         {len(chunks)} (max {MAX_CHUNK_CHARS} chars, sentence boundaries)")
     print(f"  Stitching:      Silence gaps ({SENTENCE_GAP_MS}ms sentence / {PARAGRAPH_GAP_MS}ms paragraph)")
     print(f"  Noise reduce:   {'ON (strength={})'.format(NOISE_REDUCE_STRENGTH) if ENABLE_NOISE_REDUCTION else 'OFF'}")
-    print(f"  Normalization:  Final global RMS only (preserves natural dynamics)")
+    print(f"  Normalization:  Per-chunk RMS + final global RMS (fixes volume decay)")
     print(f"  Output:         {OUTPUT_FILE}")
     print()
 
@@ -279,6 +252,10 @@ def main():
         if len(chunk_audio) == 0:
             print(f"           WARNING: Chunk {i+1} produced empty audio")
             continue
+
+        # Per-chunk RMS normalization — fixes volume decay within long chunks
+        # (attention to voice embedding fades as sequence grows, causing quieter end-of-chunk audio)
+        chunk_audio = rms_normalize(chunk_audio)
 
         chunk_duration = len(chunk_audio) / SAMPLE_RATE
         chunk_time = time.time() - chunk_start
@@ -340,7 +317,7 @@ def main():
     file_size_mb = (len(audio_full) * 4) / (1024 * 1024)
 
     print(f"\n{'=' * 70}")
-    print(f"  Generation Complete! (v5 — Less Processing, More Natural)")
+    print(f"  Generation Complete! (v5.1 — Volume Decay Fix)")
     print(f"{'=' * 70}")
     print(f"  File:            {OUTPUT_FILE}")
     print(f"  File size:       {file_size_mb:.1f} MB")
